@@ -23,8 +23,14 @@ namespace FPSCounter
         private static ConfigEntry<bool> _showUnityMethodStats;
         private static ConfigEntry<bool> _measureMemory;
         private static ConfigEntry<bool> _measureGC;
+        private static ConfigEntry<int> _pluginStatsMaxLines;
+        private static ConfigEntry<PluginStatsSortMode> _pluginStatsSortMode;
+        private static ConfigEntry<float> _hitchLogThresholdMs;
 
         internal static new ManualLogSource Logger;
+        internal static int PluginStatsMaxLines => _pluginStatsMaxLines?.Value ?? 20;
+        internal static PluginStatsSortMode CurrentPluginStatsSortMode => _pluginStatsSortMode?.Value ?? PluginStatsSortMode.MaxSpike;
+        internal static float HitchLogThresholdMs => _hitchLogThresholdMs?.Value ?? 50f;
 
         private void Start()
         {
@@ -32,7 +38,7 @@ namespace FPSCounter
 
             _showCounter = Config.Bind("General", "Toggle counter and reset stats", new KeyboardShortcut(KeyCode.U, KeyCode.LeftShift), "Key to enable and disable the plugin.");
             _shown = Config.Bind("General", "Enable", false, "Monitor performance statistics and show them on the screen. When disabled the plugin has no effect on performance.");
-            _showPluginStats = Config.Bind("General", "Enable monitoring plugins", true, "Count time each plugin takes every frame to execute. Only detects MonoBehaviour event methods, so results might be lower than expected. Has a small performance penalty.");
+            _showPluginStats = Config.Bind("General", "Enable monitoring plugins", true, "Count time each plugin takes every frame to execute. Detects MonoBehaviour event methods and Harmony prefix/postfix/finalizer patch methods, so results might be lower than expected. Has a small performance penalty.");
             _showUnityMethodStats = Config.Bind("General", "Show detailed frame stats", true, "Show how much time was spent by Unity in each part of the frame, for example how long it took to run all Update methods.");
 
             try
@@ -54,6 +60,9 @@ namespace FPSCounter
 
             _position = Config.Bind("Interface", "Screen position", TextAnchor.LowerRight, "Which corner of the screen to display the statistics in.");
             _counterColor = Config.Bind("Interface", "Color of the text", CounterColors.White, "Color of the displayed stats. Outline has a performance hit but it always easy to see.");
+            _pluginStatsMaxLines = Config.Bind("Interface", "Plugin stats max lines", 20, new ConfigDescription("Maximum number of plugin timing rows to show.", new AcceptableValueRange<int>(1, 100)));
+            _pluginStatsSortMode = Config.Bind("Interface", "Plugin stats sort mode", PluginStatsSortMode.MaxSpike, "How to sort plugin timing rows.");
+            _hitchLogThresholdMs = Config.Bind("General", "Log frame hitches over ms", 50f, new ConfigDescription("Log plugin timing snapshots when a frame exceeds this many milliseconds. Set to 0 to disable.", new AcceptableValueRange<float>(0f, 1000f)));
 
             _position.SettingChanged += (sender, args) => UpdateLooks();
             _counterColor.SettingChanged += (sender, args) => UpdateLooks();
@@ -93,7 +102,7 @@ namespace FPSCounter
                 if (_helpers[1] == null) _helpers[1] = gameObject.AddComponent<FrameCounterHelper.FrameCounterHelper2>();
 
                 if (_showPluginStats.Value)
-                    PluginCounter.Start(_helpers[0], GUID);
+                    PluginCounter.Start(GUID);
                 else
                     PluginCounter.Stop();
             }
@@ -122,7 +131,7 @@ namespace FPSCounter
         #endregion
 
         #region UI
-        const int MAX_STRING_SIZE = 1400;
+        const int MAX_STRING_SIZE = 40000;
 
         private static readonly GUIStyle _style = new GUIStyle();
         private static Rect _screenRect;
@@ -206,6 +215,20 @@ namespace FPSCounter
                 return result;
             }
 
+            private static void ResetMeasurements()
+            {
+                _fixedUpdateTime.Clear();
+                _updateTime.Clear();
+                _yieldTime.Clear();
+                _lateUpdateTime.Clear();
+                _renderTime.Clear();
+                _onGuiTime.Clear();
+                _gcAddedSize.Clear();
+                _frameTime.Clear();
+                CanProcessOnGui = false;
+                _onGuiHit = false;
+            }
+
             #endregion
 
             #region Capture
@@ -216,11 +239,13 @@ namespace FPSCounter
             private static readonly WaitForEndOfFrame _waitForEndOfFrame = new WaitForEndOfFrame();
             private IEnumerator Start()
             {
+                ResetMeasurements();
                 _measurementStopwatch = new Stopwatch();
                 var totalStopwatch = new Stopwatch();
                 var nanosecPerTick = (float)(1000 * 1000 * 100) / Stopwatch.Frequency;
                 var msScale = 1f / (nanosecPerTick * 1000f);
                 long gcPreviousAmount = 0, gcCollectionCount = 0;
+                totalStopwatch.Start();
 
                 while (true)
                 {
@@ -246,13 +271,14 @@ namespace FPSCounter
                     _measurementStopwatch.Reset();
 
                     // Get actual frame round-time
-                    _frameTime.Sample(totalStopwatch.ElapsedTicks);
+                    var currentFrameTicks = totalStopwatch.ElapsedTicks;
+                    _frameTime.Sample(currentFrameTicks);
                     totalStopwatch.Reset();
                     totalStopwatch.Start();
 
                     // Calculate only once at end of frame so all data is from a single frame
                     var avgFrame = _frameTime.GetAverage();
-                    var fps = 1000000f / (avgFrame / nanosecPerTick);
+                    var fps = avgFrame > 0 ? 1000000f / (avgFrame / nanosecPerTick) : 0f;
 
                     // Reuse the SB to reduce amount of created garbage
                     var _outputStringBuilder = fString.builder;
@@ -351,11 +377,20 @@ namespace FPSCounter
                         }
                     }
 
-                    if (PluginCounter.StringOutput != null)
+                    PluginCounter.CollectFrame(currentFrameTicks, msScale);
+
+                    if (PluginCounter.StringOutput != null && PluginCounter.StringOutputLength > 0)
                     {
-                        //_outputStringBuilder.AppendLine();
-                        _outputStringBuilder.Append("\n");
-                        _outputStringBuilder.Append(PluginCounter.StringOutput);
+                        var pluginOutputLength = PluginCounter.StringOutputLength;
+                        var availableOutputLength = _outputStringBuilder.MaxCapacity - _outputStringBuilder.Length - 1;
+                        if (availableOutputLength > 0)
+                        {
+                            //_outputStringBuilder.AppendLine();
+                            _outputStringBuilder.Append("\n");
+                            if (pluginOutputLength > availableOutputLength)
+                                pluginOutputLength = availableOutputLength;
+                            _outputStringBuilder.Append(PluginCounter.StringOutput, 0, pluginOutputLength);
+                        }
                     }
 
                     _frameOutputText = fString.PopValue();

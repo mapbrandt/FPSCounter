@@ -16,6 +16,9 @@ namespace FPSCounter
 
         public long GetAverage()
         {
+            if (_samples.Count == 0)
+                return 0;
+
             return _sampleAccumulator / _samples.Count;
         }
 
@@ -26,6 +29,12 @@ namespace FPSCounter
 
             if (_samples.Count > _windowSize)
                 _sampleAccumulator -= _samples.Dequeue();
+        }
+
+        public void Clear()
+        {
+            _samples.Clear();
+            _sampleAccumulator = 0;
         }
     }
 }
